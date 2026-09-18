@@ -233,6 +233,18 @@ actor_rollout_ref:
     fused_kernel_options:
       impl_backend: torch
     trust_remote_code: false
+  preservation:
+    enabled: false
+    dataset_path: null
+    prompt_key: prompt
+    expected_size: 1000
+    batch_size: 16
+    max_prompt_length: 2048
+    max_new_tokens: 256
+    apply_chat_template: true
+    module_name_pattern: mlp
+    projection_threshold: 0.0005
+    apply_interval: 5
 data:
   tokenizer: null
   use_shm: false

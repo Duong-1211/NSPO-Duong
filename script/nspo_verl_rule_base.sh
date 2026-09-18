@@ -1,6 +1,17 @@
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NSPO_PATH="${NSPO_PATH:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+DATA_PATH="${DATA_PATH:?Set DATA_PATH to the directory containing SafetyBench}"
+MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-0.5B-Instruct}
+PRESERVATION_DATA_PATH="${PRESERVATION_DATA_PATH:-${NSPO_PATH}/data/preservation/nspo_mix/prompts.jsonl}"
+
+test -f "${DATA_PATH}/SafetyBench/SafeRLHFfull_safety.parquet"
+test -f "${DATA_PATH}/SafetyBench/SafeRLHFfull_test_safety.parquet"
+test -f "${PRESERVATION_DATA_PATH}"
+test -f "${NSPO_PATH}/script/safe_reward.py"
+
 set -x
-DATA_PATH=""
-NSPO_PATH=""
 RAY_DEBUG=legacy python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=${DATA_PATH}/SafetyBench/SafeRLHFfull_safety.parquet \
@@ -10,7 +21,9 @@ RAY_DEBUG=legacy python3 -m verl.trainer.main_ppo \
     data.max_response_length=512 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
-    actor_rollout_ref.model.path=${DATA_PATH}/models/Qwen2.5-7B-Instruct \
+    actor_rollout_ref.model.path=${MODEL_PATH} \
+    actor_rollout_ref.preservation.enabled=True \
+    actor_rollout_ref.preservation.dataset_path=${PRESERVATION_DATA_PATH} \
     actor_rollout_ref.nccl_timeout=7200 \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
@@ -24,7 +37,7 @@ RAY_DEBUG=legacy python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=20 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     actor_rollout_ref.rollout.n=5 \

@@ -96,6 +96,41 @@ actor_rollout_ref:
     # Whether to enable loading a remote code model
     trust_remote_code: false
 
+  # General-capability prompts used to construct NSPO null-space projectors.
+  preservation:
+
+    # Keep disabled for non-NSPO recipes.
+    enabled: false
+
+    # Prompt-only JSONL artifact.
+    dataset_path: null
+
+    # Field containing the model-independent prompt.
+    prompt_key: prompt
+
+    # Fail when the checked-in artifact does not contain this exact number of records.
+    expected_size: 1000
+
+    # Number of prompts generated per projector-construction batch.
+    batch_size: 16
+
+    # Token limits used only while constructing the projector.
+    max_prompt_length: 2048
+
+    max_new_tokens: 256
+
+    # Render user prompts with the destination model's chat template exactly once.
+    apply_chat_template: true
+
+    # Protect Linear modules whose qualified name contains this value.
+    module_name_pattern: mlp
+
+    # Relative singular-value threshold for the approximate null space.
+    projection_threshold: 0.0005
+
+    # Re-project accumulated actor updates every N training iterations.
+    apply_interval: 5
+
   # Rollout model config.
   rollout:
 

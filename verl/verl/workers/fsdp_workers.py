@@ -72,6 +72,7 @@ from verl.utils.fsdp_utils import (
 )
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import compute_position_id_with_mask
+from verl.utils.nspo_projection import load_preservation_prompts
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
 from verl.utils.py_functional import convert_to_regular_types
@@ -241,12 +242,37 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.config.ref.log_prob_micro_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
 
-    def _get_proj_weight(self):
+    def _get_proj_weight(self, model_path):
         model_hidd_states_tmp = {}
         model_hidd_states = {}
         ref_w = {}
-        model_path = "/Your training model path"
-        dataset_path = "/Directory path of your general capability training dataset for Null-Space Projection"
+        preservation_config = self.config.preservation
+        dataset_path = preservation_config.get("dataset_path")
+        prompt_key = preservation_config.get("prompt_key")
+        expected_size = preservation_config.get("expected_size")
+        batch_size = preservation_config.get("batch_size")
+        max_prompt_length = preservation_config.get("max_prompt_length")
+        max_new_tokens = preservation_config.get("max_new_tokens")
+        apply_chat_template = preservation_config.get("apply_chat_template")
+        module_name_pattern = preservation_config.get("module_name_pattern")
+
+        if not dataset_path:
+            raise ValueError("actor_rollout_ref.preservation.dataset_path is required when NSPO preservation is enabled")
+        for field_name, value in {
+            "batch_size": batch_size,
+            "max_prompt_length": max_prompt_length,
+            "max_new_tokens": max_new_tokens,
+        }.items():
+            if not isinstance(value, int) or value <= 0:
+                raise ValueError(f"actor_rollout_ref.preservation.{field_name} must be a positive integer")
+        if not module_name_pattern:
+            raise ValueError("actor_rollout_ref.preservation.module_name_pattern must not be empty")
+
+        prompts = load_preservation_prompts(
+            dataset_path=dataset_path,
+            prompt_key=prompt_key,
+            expected_size=expected_size,
+        )
 
         def hook_to_get_hidd(module, fea_in, fea_out):
             module_name = module.name
@@ -254,111 +280,122 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         def register_hook_for_model(model):
             for name, module in model.named_modules():
-                if isinstance(module, torch.nn.Linear) and "mlp" in name:
-                    setattr(module, 'name', name)
+                if isinstance(module, torch.nn.Linear) and module_name_pattern in name:
+                    setattr(module, "name", name)
                     module.register_forward_hook(hook_to_get_hidd)
-        
+
         def cal_proj_matrix(matrix, alpha):
-            U, S, V = torch.svd(matrix)
-            null_index = torch.where(S < alpha * torch.max(S))
+            _, singular_values, right_vectors_h = torch.linalg.svd(matrix)
+            right_vectors = right_vectors_h.mT
+            null_index = torch.where(singular_values < alpha * torch.max(singular_values))
             if null_index[0].size() == 0:
-                proj_w = torch.zeros([V.shape[0], V.shape[0]])
+                proj_w = torch.zeros(
+                    [right_vectors.shape[0], right_vectors.shape[0]],
+                    dtype=right_vectors.dtype,
+                    device=right_vectors.device,
+                )
             else:
-                V_ = V[:, null_index[0]]
-                proj_w = torch.matmul(V_, V_.t().contiguous())
+                null_vectors = right_vectors[:, null_index[0]]
+                proj_w = torch.matmul(null_vectors, null_vectors.t().contiguous())
             return proj_w
 
-        def get_proj_weight(
-            alpha=0.0005
-        ):
+        def get_proj_weight(alpha):
             proj_w = {}
             for key in model_hidd_states.keys():
                 print(f"===Cal Proj_weight for Layer{key}===")
-                matrix=model_hidd_states[key].to('cuda').to(torch.float32)
-                proj_w[key] = cal_proj_matrix(matrix, alpha).to('cpu')
+                matrix = model_hidd_states[key].to(get_device_id(), dtype=torch.float32)
+                proj_w[key] = cal_proj_matrix(matrix, alpha).cpu()
                 del matrix
+                get_torch_device().empty_cache()
             return proj_w
-
-        def tokenize_function(examples):
-            return tokenizer.encode_plus(examples["prompt"], max_length=prompt_length, padding="max_length", return_tensors="pt", truncation=True)
 
         def get_ref_weight():
             for name, module in model.named_modules():
-                if isinstance(module, torch.nn.Linear) and "mlp" in name:
-                    ref_w[name] = module.weight.data.to(torch.float32).cpu()
-            
-        def store_embedding():
+                if isinstance(module, torch.nn.Linear) and module_name_pattern in name:
+                    ref_w[name] = module.weight.detach().to(torch.float32).cpu()
+
+        def store_embedding(attention_mask):
+            flat_mask = attention_mask.reshape(-1).bool()
             for name in model_hidd_states_tmp.keys():
                 emb = model_hidd_states_tmp[name]
+                emb = emb.reshape(-1, emb.shape[-1])[flat_mask]
+                emb_2 = torch.matmul(emb.t().contiguous(), emb)
                 if name in model_hidd_states.keys():
-                        emb_ =  emb[:, :, :].reshape(-1, emb.shape[-1])
-                        emb_2 = torch.matmul(emb_.t().contiguous(), emb_)
-                        model_hidd_states[name] = (model_hidd_states[name].to(emb.device) + emb_2).cpu()        
+                    model_hidd_states[name] = (model_hidd_states[name].to(emb.device) + emb_2).cpu()
                 else:
-                    emb_ =  emb[:, : , :].reshape(-1, emb.shape[-1])
-                    emb_2 = torch.matmul(emb_.t().contiguous(), emb_)
                     model_hidd_states[name] = emb_2.cpu()
-            torch.cuda.empty_cache()
-
+            get_torch_device().empty_cache()
 
         from transformers import AutoModelForCausalLM, AutoTokenizer
-        from datasets import load_dataset
-        import numpy as np
-        from torch.utils.data import DataLoader, Subset
         from tqdm import tqdm
-        torch.set_default_dtype(torch.bfloat16)
-        model = AutoModelForCausalLM.from_pretrained(model_path, attn_implementation="flash_attention_2", dtype=torch.bfloat16)
-        tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side='left')
-        tokenizer.pad_token = tokenizer.eos_token
-        dataset = load_dataset(dataset_path)['train']
-        model.eval()
-        sample_size = 1024 if torch.distributed.get_rank() == 0 else 128
-        batch_size = 128
-        max_length = 192
-        prompt_length = 64
-        total_size = len(dataset)
-        sample_size = min(sample_size, total_size)
-        np.random.seed(66)
-        sampled_indices = np.random.choice(total_size, sample_size, replace=False)
-        sampled_dataset = Subset(dataset, sampled_indices)
 
-        dataloader = DataLoader(
-            sampled_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=True
+        trust_remote_code = self.config.model.get("trust_remote_code", False)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            attn_implementation="flash_attention_2",
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=trust_remote_code,
         )
-        model = model.cuda()
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            padding_side="left",
+            trust_remote_code=trust_remote_code,
+        )
+        tokenizer.pad_token = tokenizer.eos_token
+        model.eval()
+        model = model.to(get_device_id())
         get_ref_weight()
-        outputs = []
+        register_hook_for_model(model)
+
         with torch.no_grad():
-            for batch in tqdm(dataloader, desc="Running Forward Pass And Collect Input Embedding"):
-                inputs = tokenize_function(batch)
-                outputs.append(model.generate(inputs['input_ids'].to(model.device), max_new_tokens=max_length, pad_token_id=tokenizer.eos_token_id))
+            for batch_start in tqdm(
+                range(0, len(prompts), batch_size),
+                desc="Building NSPO preservation projector",
+            ):
+                batch_prompts = prompts[batch_start : batch_start + batch_size]
+                if apply_chat_template:
+                    conversations = [[{"role": "user", "content": prompt}] for prompt in batch_prompts]
+                    batch_prompts = tokenizer.apply_chat_template(
+                        conversations,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
 
-            register_hook_for_model(model)
-            for output in outputs:
-                _ = model(output)
-                del _
-                store_embedding(prompt_length)
-                torch.cuda.empty_cache()
-            
-            del outputs
+                inputs = tokenizer(
+                    batch_prompts,
+                    max_length=max_prompt_length,
+                    padding=True,
+                    return_tensors="pt",
+                    truncation=True,
+                ).to(model.device)
+                output = model.generate(
+                    **inputs,
+                    do_sample=False,
+                    max_new_tokens=max_new_tokens,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+                generated_mask = output[:, inputs.input_ids.shape[1] :].ne(tokenizer.pad_token_id)
+                attention_mask = torch.cat([inputs.attention_mask, generated_mask], dim=1)
+                model(input_ids=output, attention_mask=attention_mask)
+                store_embedding(attention_mask)
+                model_hidd_states_tmp.clear()
+                del inputs, output, attention_mask, generated_mask
+                get_torch_device().empty_cache()
+
             del model
-            del model_hidd_states_tmp
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            get_torch_device().empty_cache()
+            get_torch_device().synchronize()
 
-        return get_proj_weight(alpha=0.00005), ref_w
+        return get_proj_weight(alpha=self.config.preservation.get("projection_threshold")), ref_w
     
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def amend_perturbation(self):
+        module_name_pattern = self.config.preservation.get("module_name_pattern")
         with FSDP.summon_full_params(self.actor_module_fsdp):
             with torch.no_grad():
                 for name, module in self.actor_module_fsdp.named_modules():
-                    if isinstance(module, torch.nn.Linear) and "mlp" in name:
+                    if isinstance(module, torch.nn.Linear) and module_name_pattern in name:
                         ref_w_device = module.ref_w.to(module.weight.device)
                         perturbation = module.weight - ref_w_device
                         perturbation = torch.matmul(perturbation, module.proj_w.to(module.weight.device))
@@ -543,17 +580,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
-        use_proj = role == "actor"
+        preservation_config = self.config.get("preservation", {})
+        use_proj = role == "actor" and preservation_config.get("enabled", False)
         if use_proj:
             with torch.no_grad():
-                projs, ref_w = self._get_proj_weight()
+                projs, ref_w = self._get_proj_weight(model_path=model_path)
                 torch.distributed.barrier()
                 for name in projs.keys():
                     torch.distributed.broadcast(projs[name], src=0)
                 torch.cuda.empty_cache()
 
                 for name, module in actor_module.named_modules():
-                    if isinstance(module, torch.nn.Linear) and "mlp" in name:
+                    if isinstance(module, torch.nn.Linear) and preservation_config.get("module_name_pattern") in name:
 
                         if name in projs.keys():
                             setattr(module, "proj_w", projs[name].cpu())

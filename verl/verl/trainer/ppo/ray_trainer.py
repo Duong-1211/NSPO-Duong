@@ -945,7 +945,12 @@ class RayPPOTrainer:
             else False
         )
         next_step_profile = False
-        counter = 0
+        preservation_config = self.config.actor_rollout_ref.get("preservation", {})
+        preservation_enabled = preservation_config.get("enabled", False)
+        projection_interval = preservation_config.get("apply_interval")
+        if preservation_enabled and (not isinstance(projection_interval, int) or projection_interval <= 0):
+            raise ValueError("actor_rollout_ref.preservation.apply_interval must be a positive integer")
+        projection_counter = 0
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
@@ -1116,6 +1121,12 @@ class RayPPOTrainer:
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
+                        projection_counter += 1
+                        if preservation_enabled and (
+                            projection_counter % projection_interval == 0 or is_last_step
+                        ):
+                            self.actor_rollout_wg.amend_perturbation()
+
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
@@ -1234,8 +1245,3 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
-
-                lam = 5
-                if counter % lam == 0:
-                    self.actor_rollout_wg.amend_perturbation()
-                counter += 1
