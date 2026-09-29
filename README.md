@@ -40,40 +40,80 @@ NSPO/
 
 ## 🚀 Quick Start
 
-### 1. Setup & Environment
+Run on Linux with CUDA. The default configuration uses GPU 0 for
+`Qwen/Qwen2.5-0.5B-Instruct` and GPU 1 for `meta-llama/Llama-Guard-3-1B`.
+Set device IDs, model paths, dataset paths and reward request settings in
+[`config/nspo.env`](config/nspo.env). These defaults require two GPUs with sufficient VRAM;
+a single 4 GB GPU is not a validated training setup.
 
-**Download Assets:**
-* **Base Model:** [Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct)
-* **Dataset:** [PKU-SafeRLHF](https://huggingface.co/datasets/PKU-Alignment/PKU-SafeRLHF)
+### Install
 
-**Installation:**
+From the repository root, in your CUDA/PyTorch environment (Python 3.10+):
+
 ```bash
-cd NSPO/verl
-pip install -r requirements.txt
-pip install .
+pip install -r verl/requirements.txt
+pip install -e ./verl
 ```
-### 2. Configuration
-   - Modify `model_path` and `dataset_path` in:
-     ```
-     NSPO/verl/verl/workers/fsdp_workers.py (lines 248–249)
-     ```
-   - In the script directory, update `DATA_PATH` and `NSPO_PATH` in:
-     ```
-     NSPO/script/nspo_verl_rule_base.sh
-     ```
-   - In the script directory, update `MODEL_PATH` in:
-     ```
-     NSPO/script/start_vllm_llama_guard.sh
-     ```
 
-### 3. Launch Services and Training
-   ```bash
-   cd script
-   bash start_vllm_llama_guard.sh
-   bash nspo_verl_rule_base.sh
-   ```
+### Data
+
+The prepared files are included in `data/safety/pku_saferlhf_8k/`:
+
+- `SafeRLHFfull_safety.parquet`: 8,000 unique prompts sampled without replacement from the official train split.
+- `SafeRLHFfull_test_safety.parquet`: 1,000 unique prompts sampled from the official test split, excluding training prompts, used for validation.
+- `manifest.json`: dataset revision, seed (42), counts and source row indices.
+
+To regenerate them:
+
+```bash
+python script/prepare_pku_saferlhf.py --config config/nspo.env
+```
+
+Source: [PKU-SafeRLHF](https://huggingface.co/datasets/PKU-Alignment/PKU-SafeRLHF)
+(CC-BY-NC-4.0). This is a random 8K subset, not a reproduction of the paper's
+exact safety-data selection. Prompt length filtering during training may reduce
+the effective row count. The separate 1,000-prompt preservation pool remains in
+`data/preservation/nspo_mix/prompts.jsonl`.
+
+### Start the guard and train
+
+Obtain access to [Llama-Guard-3-1B](https://huggingface.co/meta-llama/Llama-Guard-3-1B)
+and authenticate with Hugging Face (`hf auth login`). The server downloads the
+model on first launch; alternatively set `REWARD_MODEL_PATH` to a local checkpoint.
+
+Terminal 1, from the repository root:
+
+```bash
+bash script/start_vllm_llama_guard.sh
+```
+
+Terminal 2, using the same environment:
+
+```bash
+curl http://127.0.0.1:52001/v1/models
+bash script/nspo_verl_rule_base.sh
+```
+
+For an initial one-step smoke run:
+
+```bash
+bash script/nspo_verl_rule_base.sh trainer.total_training_steps=1 trainer.save_freq=-1 trainer.test_freq=-1
+```
+
+The guard classifies the original user prompt and generated assistant response
+with its native chat template. Rewards remain `safe = 0`, `unsafe = -1`.
+Request failures or invalid verdicts stop scoring rather than silently assigning
+safe rewards. This smaller classifier changes the reward signal compared with
+Llama Guard 4 12B; comparable safety quality has not been established.
+
+Use `NSPO_CONFIG_PATH=/absolute/path/to/custom.env` for another configuration.
+Checkpoints default to
+`checkpoints/verl_grpo_safety_align_Qwen_NSPO/verl_grpo_safety_align_Qwen_NSPO/`.
+The smoke run still constructs the preservation projector; one step does not
+exercise every periodic NSPO projection update.
 
 ---
+
 
 ## 📊 Evaluation
 

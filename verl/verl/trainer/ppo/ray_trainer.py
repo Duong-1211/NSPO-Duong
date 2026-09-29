@@ -1116,6 +1116,8 @@ class RayPPOTrainer:
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
+                            batch.meta_info["global_steps"] = self.global_steps
+                            batch.meta_info["log_update_steps"] = self.config.trainer.get("log_update_steps", False)
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
@@ -1126,6 +1128,8 @@ class RayPPOTrainer:
                             projection_counter % projection_interval == 0 or is_last_step
                         ):
                             self.actor_rollout_wg.amend_perturbation()
+                            if self.config.trainer.get("log_update_steps", False):
+                                print(f"[NSPO] global_step={self.global_steps} projection=applied", flush=True)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

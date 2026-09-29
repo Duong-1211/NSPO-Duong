@@ -364,6 +364,9 @@ class DataParallelPPOActor(BasePPOActor):
         # make sure we are in training mode
         self.actor_module.train()
 
+        global_step = data.meta_info.get("global_steps")
+        log_update_steps = data.meta_info.get("log_update_steps", False)
+
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
 
         select_keys = [
@@ -397,7 +400,7 @@ class DataParallelPPOActor(BasePPOActor):
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
         metrics = {}
-        for _ in range(self.config.ppo_epochs):
+        for ppo_epoch in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
@@ -493,6 +496,16 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()
+                if log_update_steps:
+                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                    status = "updated" if torch.isfinite(grad_norm).item() else "skipped_nonfinite"
+                    print(
+                        f"[ActorUpdate] global_step={global_step} rank={rank} "
+                        f"ppo_epoch={ppo_epoch + 1} minibatch={batch_idx + 1}/{len(mini_batches)} "
+                        f"microbatches={len(micro_batches)} optimizer={status} "
+                        f"grad_norm={grad_norm.detach().item():.6g}",
+                        flush=True,
+                    )
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()

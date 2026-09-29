@@ -211,6 +211,9 @@ algorithm:
 # config for the trainer
 trainer:
 
+  # Emit per-minibatch optimizer outcomes and completed NSPO projections.
+  log_update_steps: true
+
   # Whether to balance batch sizes across distributed workers
   balance_batch: True
 

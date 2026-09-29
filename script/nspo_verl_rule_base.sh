@@ -2,20 +2,26 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NSPO_PATH="${NSPO_PATH:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
-DATA_PATH="${DATA_PATH:?Set DATA_PATH to the directory containing SafetyBench}"
-MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-0.5B-Instruct}
-PRESERVATION_DATA_PATH="${PRESERVATION_DATA_PATH:-${NSPO_PATH}/data/preservation/nspo_mix/prompts.jsonl}"
+NSPO_CONFIG_PATH="${NSPO_CONFIG_PATH:-${NSPO_PATH}/config/nspo.env}"
 
-test -f "${DATA_PATH}/SafetyBench/SafeRLHFfull_safety.parquet"
-test -f "${DATA_PATH}/SafetyBench/SafeRLHFfull_test_safety.parquet"
+set -a
+source "${NSPO_CONFIG_PATH}"
+set +a
+
+SAFETY_DATA_PATH="${SAFETY_OUTPUT_DIR}"
+[[ "${SAFETY_DATA_PATH}" = /* ]] || SAFETY_DATA_PATH="${NSPO_PATH}/${SAFETY_DATA_PATH}"
+[[ "${PRESERVATION_DATA_PATH}" = /* ]] || PRESERVATION_DATA_PATH="${NSPO_PATH}/${PRESERVATION_DATA_PATH}"
+
+test -f "${SAFETY_DATA_PATH}/${SAFETY_TRAIN_FILE}"
+test -f "${SAFETY_DATA_PATH}/${SAFETY_VAL_FILE}"
 test -f "${PRESERVATION_DATA_PATH}"
 test -f "${NSPO_PATH}/script/safe_reward.py"
 
 set -x
-RAY_DEBUG=legacy python3 -m verl.trainer.main_ppo \
+CUDA_VISIBLE_DEVICES="${TRAIN_CUDA_VISIBLE_DEVICES}" RAY_DEBUG=legacy python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=${DATA_PATH}/SafetyBench/SafeRLHFfull_safety.parquet \
-    data.val_files=${DATA_PATH}/SafetyBench/SafeRLHFfull_test_safety.parquet \
+    data.train_files=${SAFETY_DATA_PATH}/${SAFETY_TRAIN_FILE} \
+    data.val_files=${SAFETY_DATA_PATH}/${SAFETY_VAL_FILE} \
     data.train_batch_size=320 \
     data.max_prompt_length=512 \
     data.max_response_length=512 \
@@ -44,15 +50,16 @@ RAY_DEBUG=legacy python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=20 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.use_kl_in_reward=False \
-    custom_reward_function.name=compute_score_batched \
+    reward_model.reward_manager=batch \
+    custom_reward_function.name=compute_score_batch \
     custom_reward_function.path=${NSPO_PATH}/script/safe_reward.py \
     trainer.critic_warmup=0 \
-    trainer.logger=wandb \
+    trainer.logger=${TRAIN_LOGGER} \
     trainer.project_name='verl_grpo_safety_align_Qwen_NSPO' \
     trainer.experiment_name='verl_grpo_safety_align_Qwen_NSPO' \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node=${TRAIN_N_GPUS_PER_NODE} \
     trainer.nnodes=1 \
     trainer.save_freq=5 \
     trainer.test_freq=5 \
     trainer.val_before_train=False \
-    trainer.total_epochs=1 $@
+    trainer.total_epochs=1 "$@"
